@@ -4,6 +4,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import path from 'node:path';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { Job, Queue, UnrecoverableError, Worker } from 'bullmq';
@@ -700,95 +701,114 @@ async function processTranscodeJob(job: Job): Promise<void> {
   }
 }
 
-const worker = new Worker(TRANSCODE_QUEUE, processTranscodeJob, {
-  connection: { url: env.REDIS_URL },
-  concurrency: workerConfig.concurrency,
-  // FFmpeg jobs are long: renew the lock less often and tolerate slow event loops
-  lockDuration: 120_000,
-  stalledInterval: 60_000,
-  autorun: false,
-});
+/* ─── In-process worker bootstrap ────────────────────────── */
 
-worker.on('ready', () => {
-  console.log('[worker] Worker ready, waiting for jobs...');
-});
+/**
+ * Start the transcode + analytics BullMQ workers in the current Node.js process.
+ *
+ * Returns a handle exposing `close()` for graceful shutdown. Idempotent: calling
+ * it twice returns the same handle, so importers that share a process can safely
+ * call it from multiple boot paths (e.g. the API inlining the worker for one-
+ * container deployments).
+ *
+ * `exitOnShutdown` controls whether the standalone `HOVOD_ROLE=worker` entrypoint
+ * also installs SIGTERM/SIGINT handlers and exits the process. Embedders (the
+ * API) set it to `false` and own their own shutdown sequencing.
+ */
+let workerHandle: WorkerHandle | null = null;
 
-worker.on('failed', (job, err) => {
-  if (!job) {
-    console.error(`[worker] A job failed without job data: ${err.message}`);
-    return;
-  }
-  const parsed = jobDataSchema.safeParse(job.data);
-  // Only write terminal state when BullMQ will not retry the job
-  job.getState().then(async (state) => {
-    if (state !== 'failed') {
-      console.warn(`[worker] Job ${job.id} failed, retry scheduled (${state}): ${err.message}`);
-      return;
-    }
-    console.error(`[worker] Job ${job.id} failed permanently: ${err.message}`);
-    if (parsed.success) await markAssetFailed(parsed.data.assetId, parsed.data.jobId, sanitizeErrorMessage(err));
-  }).catch((stateErr) => {
-    console.error(`[worker] Could not resolve state of failed job ${job.id}: ${(stateErr as Error).message}`);
-  });
-});
-
-// BullMQ emits Redis connection errors here — without a listener they crash the process
-worker.on('error', (err) => {
-  console.error(`[worker] Worker error: ${err.message}`);
-});
-
-worker.on('stalled', (jobId) => {
-  console.warn(`[worker] Job ${jobId} stalled (lock expired) — BullMQ will retry it or fail it`);
-  // A job that stalled too often is moved straight to failed without a 'failed' event
-  Job.fromId(transcodeQueue, jobId).then(async (job) => {
-    if (!job) return;
-    const state = await job.getState();
-    if (state !== 'failed') return;
-    const parsed = jobDataSchema.safeParse(job.data);
-    if (!parsed.success) return;
-    console.error(`[worker] Job ${jobId} exceeded the stall limit — marking asset ${parsed.data.assetId} as error`);
-    await markAssetFailed(parsed.data.assetId, parsed.data.jobId, INTERRUPTED_MESSAGE);
-  }).catch((err) => {
-    console.error(`[worker] Could not inspect stalled job ${jobId}: ${(err as Error).message}`);
-  });
-});
-
-/* ─── Analytics Worker ────────────────────────────────────── */
-
-const analyticsWorker = createAnalyticsWorker(env.REDIS_URL);
-
-/* ─── Lifecycle ───────────────────────────────────────────── */
-
-let shuttingDown = false;
-
-async function shutdown(signal: string, exitCode = 0) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  console.log(`[worker] Received ${signal}, shutting down...`);
-  const forceExit = setTimeout(() => {
-    console.error('[worker] Shutdown timed out, exiting');
-    process.exit(exitCode || 1);
-  }, 30_000);
-  forceExit.unref();
-  try {
-    await Promise.allSettled([worker.close(), analyticsWorker.close(), transcodeQueue.close()]);
-  } finally {
-    process.exit(exitCode);
-  }
+export interface WorkerHandle {
+  close(): Promise<void>;
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('unhandledRejection', (reason) => {
-  console.error('[worker] Unhandled promise rejection:', reason instanceof Error ? reason.stack ?? reason.message : reason);
-  shutdown('unhandledRejection', 1);
-});
-process.on('uncaughtException', (err) => {
-  console.error('[worker] Uncaught exception:', err.stack ?? err.message);
-  shutdown('uncaughtException', 1);
-});
+export interface StartWorkerOptions {
+  /** Install process signal handlers and exit on shutdown (standalone worker role). */
+  exitOnShutdown?: boolean;
+}
 
-async function boot() {
+export async function startWorker(options: StartWorkerOptions = {}): Promise<WorkerHandle> {
+  if (workerHandle) return workerHandle;
+  const exitOnShutdown = options.exitOnShutdown ?? false;
+
+  const worker = new Worker(TRANSCODE_QUEUE, processTranscodeJob, {
+    connection: { url: env.REDIS_URL },
+    concurrency: workerConfig.concurrency,
+    // FFmpeg jobs are long: renew the lock less often and tolerate slow event loops
+    lockDuration: 120_000,
+    stalledInterval: 60_000,
+    autorun: false,
+  });
+
+  worker.on('ready', () => {
+    console.log('[worker] Worker ready, waiting for jobs...');
+  });
+
+  worker.on('failed', (job, err) => {
+    if (!job) {
+      console.error(`[worker] A job failed without job data: ${err.message}`);
+      return;
+    }
+    const parsed = jobDataSchema.safeParse(job.data);
+    // Only write terminal state when BullMQ will not retry the job
+    job.getState().then(async (state) => {
+      if (state !== 'failed') {
+        console.warn(`[worker] Job ${job.id} failed, retry scheduled (${state}): ${err.message}`);
+        return;
+      }
+      console.error(`[worker] Job ${job.id} failed permanently: ${err.message}`);
+      if (parsed.success) await markAssetFailed(parsed.data.assetId, parsed.data.jobId, sanitizeErrorMessage(err));
+    }).catch((stateErr) => {
+      console.error(`[worker] Could not resolve state of failed job ${job.id}: ${(stateErr as Error).message}`);
+    });
+  });
+
+  // BullMQ emits Redis connection errors here — without a listener they crash the process
+  worker.on('error', (err) => {
+    console.error(`[worker] Worker error: ${err.message}`);
+  });
+
+  worker.on('stalled', (jobId) => {
+    console.warn(`[worker] Job ${jobId} stalled (lock expired) — BullMQ will retry it or fail it`);
+    // A job that stalled too often is moved straight to failed without a 'failed' event
+    Job.fromId(transcodeQueue, jobId).then(async (job) => {
+      if (!job) return;
+      const state = await job.getState();
+      if (state !== 'failed') return;
+      const parsed = jobDataSchema.safeParse(job.data);
+      if (!parsed.success) return;
+      console.error(`[worker] Job ${jobId} exceeded the stall limit — marking asset ${parsed.data.assetId} as error`);
+      await markAssetFailed(parsed.data.assetId, parsed.data.jobId, INTERRUPTED_MESSAGE);
+    }).catch((err) => {
+      console.error(`[worker] Could not inspect stalled job ${jobId}: ${(err as Error).message}`);
+    });
+  });
+
+  /* ─── Analytics Worker ────────────────────────────────────── */
+
+  const analyticsWorker = createAnalyticsWorker(env.REDIS_URL);
+
+  /* ─── Lifecycle ───────────────────────────────────────────── */
+
+  let shuttingDown = false;
+
+  async function shutdown(signal: string, exitCode = 0) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[worker] Received ${signal}, shutting down...`);
+    const forceExit = setTimeout(() => {
+      console.error('[worker] Shutdown timed out, exiting');
+      if (exitOnShutdown) process.exit(exitCode || 1);
+    }, 30_000);
+    forceExit.unref();
+    try {
+      await Promise.allSettled([worker.close(), analyticsWorker.close(), transcodeQueue.close()]);
+    } finally {
+      if (exitOnShutdown) process.exit(exitCode);
+    }
+  }
+
+  /* ─── Boot ───────────────────────────────────────────────── */
+
   const capabilities = await getFfmpegCapabilities();
   console.log(`[worker] FFmpeg ${capabilities.version}: zscale=${capabilities.zscale ? 'yes' : 'no'}, tonemap=${capabilities.tonemap ? 'yes' : 'no'} → HDR tone-mapping ${capabilities.hdrToneMapping ? 'enabled' : 'disabled (fallback to plain yuv420p)'}`);
 
@@ -805,13 +825,50 @@ async function boot() {
     console.error(`[worker] Startup reconciliation failed: ${(err as Error).message}`);
   }
 
+  if (exitOnShutdown) {
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('unhandledRejection', (reason) => {
+      console.error('[worker] Unhandled promise rejection:', reason instanceof Error ? reason.stack ?? reason.message : reason);
+      shutdown('unhandledRejection', 1);
+    });
+    process.on('uncaughtException', (err) => {
+      console.error('[worker] Uncaught exception:', err.stack ?? err.message);
+      shutdown('uncaughtException', 1);
+    });
+  }
+
   worker.run().catch((err) => {
     console.error(`[worker] Worker loop crashed: ${(err as Error).message}`);
     shutdown('worker-crash', 1);
   });
+
+  workerHandle = {
+    close: () => shutdown('close', 0),
+  };
+  return workerHandle;
 }
 
-boot().catch((err) => {
-  console.error(`[worker] Boot failed: ${(err as Error).message}`);
-  shutdown('boot-failure', 1);
-});
+/* ─── Standalone entrypoint ──────────────────────────────── */
+
+/**
+ * Auto-start when this file is the program entry (`node dist/index.js`), i.e.
+ * the `HOVOD_ROLE=worker` standalone container. Embedders (`@hovod/api`) call
+ * `startWorker()` directly with `exitOnShutdown: false` and own their own
+ * shutdown sequencing.
+ */
+const isMainModule = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return import.meta.url === pathToFileURL(process.argv[1]).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (isMainModule) {
+  startWorker({ exitOnShutdown: true }).catch((err) => {
+    console.error(`[worker] Boot failed: ${(err as Error).message}`);
+    process.exit(1);
+  });
+}

@@ -8,6 +8,7 @@ import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import { env, isCloud, appUrl, emailEnabled, corsReflectsAnyOrigin, corsOrigins } from './env.js';
 import { runMigrations, bootstrapDefaultOrg } from './db.js';
+import type { WorkerHandle } from '@hovod/worker';
 import { registerErrorHandler } from './middleware/error-handler.js';
 import { registerAuth, extractCredential, type RateLimitCheck } from './middleware/auth.js';
 import { configureBucket } from './s3.js';
@@ -218,9 +219,11 @@ if (existsSync(dashboardDir)) {
 /* ─── Graceful shutdown ──────────────────────────────────── */
 
 let reconcile: ReconcileScheduler | null = null;
+let inProcessWorker: WorkerHandle | null = null;
 
 async function shutdown(signal: string) {
   app.log.info(`Received ${signal}, shutting down...`);
+  await inProcessWorker?.close().catch(() => {});
   await reconcile?.stop();
   await app.close();
   process.exit(0);
@@ -250,6 +253,22 @@ const start = async () => {
   await app.listen({ port: env.PORT, host: '0.0.0.0' });
   reconcile = startReconcileScheduler(app.log);
 
+  // Run the transcode + analytics BullMQ workers in-process unless the deployment
+  // is split (`HOVOD_ROLE=worker`) where a separate container handles them.
+  // One-container deployments (`allinone`, default; or `api`) get jobs processed
+  // in the same Node.js process as the HTTP server.
+  const role = (process.env.HOVOD_ROLE ?? 'allinone').toLowerCase();
+  if (role !== 'worker') {
+    try {
+      const { startWorker } = await import('@hovod/worker');
+      inProcessWorker = await startWorker({ exitOnShutdown: false });
+      app.log.info('In-process transcode + analytics worker started');
+    } catch (err) {
+      app.log.error({ err }, 'Failed to start in-process worker');
+      throw err;
+    }
+  }
+
   const dashboardMode = existsSync(dashboardDir) ? `built-in (:${env.PORT})` : appUrl;
   const lines: [string, string][] = [
     ['API',       `http://0.0.0.0:${env.PORT}`],
@@ -259,6 +278,7 @@ const start = async () => {
     ['S3',        env.S3_ENDPOINT ?? 'AWS regional endpoint'],
     ['Mode',      isCloud ? 'cloud (Stripe, plan limits)' : 'self-host (unlimited)'],
     ['Email',     emailEnabled ? 'Resend' : 'disabled'],
+    ['Worker',    inProcessWorker ? 'in-process' : 'external (HOVOD_ROLE=worker)'],
   ];
   const maxVal = Math.max(...lines.map(([, v]) => v.length));
   const w = maxVal + 14; // label(10) + padding
