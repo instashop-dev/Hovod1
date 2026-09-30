@@ -179,7 +179,12 @@ depend() { touch "$RC/$1/dependencies.d/$2"; }   # depend SERVICE ON
 
 services=()
 case "$ROLE" in
-  allinone) services=(api worker) ;;
+  # `allinone`: one container, one process — the API service starts the transcode
+  # + analytics BullMQ workers in-process (see apps/api/src/index.ts), so the
+  # standalone worker s6 service must stay disabled here to avoid two consumers
+  # fighting over the same queue. The Dockerfile's `api` s6 service is the only
+  # long-running process in this role.
+  allinone) services=(api) ;;
   api)      services=(api) ;;
   worker)   services=(worker) ;;
 esac

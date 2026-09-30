@@ -100,9 +100,15 @@ docker exec hovod s6-svc -r /run/service/api       # restart the API only
 
 | `HOVOD_ROLE` | Starts | Embedded MariaDB/Redis | Requires |
 |--------------|--------|------------------------|----------|
-| `allinone` (default) | API + dashboard + worker | Yes, unless `DATABASE_URL` / `REDIS_URL` are set | S3 variables |
-| `api` | API + dashboard | Never | S3 variables, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET` |
-| `worker` | Worker | Never | S3 variables, `DATABASE_URL`, `REDIS_URL` |
+| `allinone` (default) | API + dashboard (transcode + analytics worker runs in-process inside the API service) | Yes, unless `DATABASE_URL` / `REDIS_URL` are set | S3 variables |
+| `api` | API + dashboard + in-process worker | Never | S3 variables, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET` |
+| `worker` | Worker (separate container, joins the same Redis queue) | Never | S3 variables, `DATABASE_URL`, `REDIS_URL` |
+
+In one-container deployments (`allinone`, default; or `api`) the BullMQ transcode
+and analytics workers start inside the same Node.js process as the API
+(`apps/api/src/index.ts` calls `startWorker({ exitOnShutdown: false })`). The
+worker is only a standalone s6 service when `HOVOD_ROLE=worker` — that's the
+"split deployment" mode (see below).
 
 ---
 

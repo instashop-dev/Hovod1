@@ -159,11 +159,12 @@ One `Dockerfile` produces the only image. `HOVOD_ROLE` selects what runs:
 
 | Role | Services started |
 |------|------------------|
-| `allinone` (default) | MariaDB + Redis + worker + API |
-| `api` | API only (external `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET` required) |
+| `allinone` (default) | MariaDB + Redis + API (worker runs in-process in the API service) |
+| `api` | API only with in-process worker (external `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET` required) |
 | `worker` | worker only (external `DATABASE_URL`, `REDIS_URL` required) |
 
 - Supervised by **s6-overlay v3**: service definitions in `docker/rootfs/etc/hovod/s6-rc.d/`, boot hook in `docker/rootfs/etc/s6-overlay/scripts/hovod-stage2-hook`.
+- The transcode + analytics BullMQ workers are started in-process from the API service in `allinone` and `api` roles (see `apps/api/src/index.ts` → `startWorker({ exitOnShutdown: false })`). The standalone `worker` s6 service only runs in the `worker` role.
 - Secrets (`JWT_SECRET`, MariaDB root password) are generated once and persisted in `/data/.hovod-secrets` (env > file > generated).
 - API and worker run as the non-root `hovod` user; role-aware `HEALTHCHECK`; `hovod-backup` / `hovod-restore` / `hovod-cli` on the PATH.
 - There are **no per-app Dockerfiles** — `apps/*/Dockerfile` were removed in v1.0.0.
